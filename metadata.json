@@ -1,0 +1,8 @@
+{
+  "name": "SnapStream Media Analysis",
+  "description": "An AWS-powered intelligent media platform for uploading, analyzing, and managing multimedia content using AI-driven insights for news, marketing, and enterprise workflows.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
