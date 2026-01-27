@@ -1,26 +1,32 @@
-from flask import Flask, request, jsonify, session
-from flask_cors import CORS
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+import os
 import boto3
 import uuid
-import json
-import os
+from werkzeug.utils import secure_filename
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
 app = Flask(__name__)
-app.secret_key = 'snapstream_secret_key' # Required for session management
-CORS(app)
+app.secret_key = os.environ.get('SECRET_KEY', 'snapstream_fallback_key')
 
-# --- AWS Configuration ---
-REGION = 'us-east-1' 
-SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:604665149129:aws_capstone_topic' 
+# --- AWS Universal Configuration ---
+# By NOT passing keys here, Boto3 looks at IAM Roles (Cloud) or ~/.aws (Local)
+REGION = 'us-east-1'
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:604665149129:aws_capstone_topic'
 
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
 sns = boto3.client('sns', region_name=REGION)
 
-# DynamoDB Tables (Ensure these Partition Keys are set in AWS: 'id' for both)
-users_table = dynamodb.Table('users')
-media_table = dynamodb.Table('media_items')
+# Table Definitions
+users_table = dynamodb.Table('Users')
+admin_users_table = dynamodb.Table('AdminUsers')
+projects_table = dynamodb.Table('Projects')
+enrollments_table = dynamodb.Table('Enrollments')
+
+# Configuration for File Uploads
+UPLOAD_FOLDER = 'static/uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def send_notification(subject, message):
     try:
@@ -30,126 +36,93 @@ def send_notification(subject, message):
             Message=message
         )
     except ClientError as e:
-        print(f"Error sending notification: {e}")
+        print(f"SNS Error: {e.response['Error']['Message']}")
 
-# --- API Routes ---
+# --- Core Routes ---
 
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.json
-    user_id = str(uuid.uuid4())
-    
-    # Check if email exists (Using scan for simplicity in this exercise)
-    existing_users = users_table.scan(
-        FilterExpression=boto3.dynamodb.conditions.Attr('email').eq(data['email'])
-    )
-    if existing_users['Items']:
-        return jsonify({"error": "Email already exists"}), 400
+@app.route('/')
+def index():
+    if 'username' in session:
+        return redirect(url_for('home'))
+    return render_template('index.html')
 
-    user_item = {
-        'id': user_id,
-        'name': data['name'],
-        'email': data['email'],
-        'password': data['password'], # Note: In production, hash this!
-        'role': data['role']
-    }
-    
-    users_table.put_item(Item=user_item)
-    send_notification("New SnapStream Signup", f"User {data['name']} ({data['role']}) registered.")
-    
-    return jsonify(user_item), 201
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        response = users_table.get_item(Key={'username': username})
+        if 'Item' in response:
+            flash("User already exists!")
+            return redirect(url_for('signup'))
+        
+        users_table.put_item(Item={'username': username, 'password': password})
+        send_notification("New User Signup", f"User {username} has joined SnapStream.")
+        return redirect(url_for('login'))
+    return render_template('signup.html')
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    data = request.json
-    # Scan for matching email
-    response = users_table.scan(
-        FilterExpression=boto3.dynamodb.conditions.Attr('email').eq(data['email'])
-    )
-    users = response.get('Items', [])
-    
-    if users and users[0]['password'] == data['password']:
-        user = users[0]
-        send_notification("User Login", f"User {user['email']} logged into SnapStream.")
-        return jsonify({
-            "id": user['id'],
-            "name": user['name'],
-            "email": user['email'],
-            "role": user['role']
-        }), 200
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
         
-    return jsonify({"error": "Invalid email or password"}), 401
+        response = users_table.get_item(Key={'username': username})
+        if 'Item' in response and response['Item']['password'] == password:
+            session['username'] = username
+            send_notification("User Login", f"User {username} logged in.")
+            return redirect(url_for('home'))
+        flash("Invalid credentials!")
+    return render_template('login.html')
 
-@app.route('/api/media', methods=['GET'])
-def get_media():
-    owner_id = request.args.get('owner_id')
-    is_admin = request.args.get('is_admin') == 'true'
+@app.route('/home')
+def home():
+    if 'username' not in session: return redirect(url_for('login'))
+    username = session['username']
     
-    if is_admin:
-        response = media_table.scan()
-    else:
-        # Scan for media belonging to owner
-        response = media_table.scan(
-            FilterExpression=boto3.dynamodb.conditions.Attr('owner_id').eq(owner_id)
-        )
+    # Fetch Enrollments
+    res_enroll = enrollments_table.get_item(Key={'username': username})
+    project_ids = res_enroll.get('Item', {}).get('project_ids', [])
+    
+    my_projects = []
+    for pid in project_ids:
+        p_res = projects_table.get_item(Key={'id': pid})
+        if 'Item' in p_res: my_projects.append(p_res['Item'])
+            
+    return render_template('home.html', username=username, my_projects=my_projects)
+
+# --- Admin Functionality ---
+
+@app.route('/admin/create-project', methods=['GET', 'POST'])
+def admin_create_project():
+    if 'admin' not in session: return redirect(url_for('admin_login'))
+    
+    if request.method == 'POST':
+        title = request.form['title']
+        image = request.files['image']
         
-    items = response.get('Items', [])
-    # Sort items by upload_date manually since Scan doesn't sort
-    items.sort(key=lambda x: x.get('upload_date', ''), reverse=True)
-    
-    return jsonify(items)
+        img_filename = secure_filename(image.filename) if image else None
+        if img_filename:
+            image.save(os.path.join(app.config['UPLOAD_FOLDER'], img_filename))
+        
+        project_id = str(uuid.uuid4())
+        projects_table.put_item(Item={
+            'id': project_id,
+            'title': title,
+            'problem_statement': request.form['problem_statement'],
+            'image': img_filename
+        })
+        send_notification("Admin Action", f"New Project Created: {title}")
+        return redirect(url_for('admin_dashboard'))
+        
+    return render_template('admin_create_project.html')
 
-@app.route('/api/media', methods=['POST'])
-def create_media():
-    data = request.json
-    # If frontend doesn't provide ID, generate one
-    media_id = data.get('id') or str(uuid.uuid4())
-    
-    media_item = {
-        'id': media_id,
-        'owner_id': data.get('owner_id'),
-        'name': data['name'],
-        'type': data['type'],
-        'size': data['size'],
-        'status': data['status'],
-        'url': data['url'],
-        'thumbnail_url': data.get('thumbnailUrl'),
-        'profile': data.get('profile'),
-        'upload_date': str(boto3.utils.rfc3339_date()) # Current timestamp
-    }
-    
-    media_table.put_item(Item=media_item)
-    return jsonify({"status": "created", "id": media_id}), 201
-
-@app.route('/api/media/<item_id>/analysis', methods=['PUT'])
-def update_analysis(item_id):
-    data = request.json
-    
-    media_table.update_item(
-        Key={'id': item_id},
-        UpdateExpression="set analysis_results = :a, #stat = :s",
-        ExpressionAttributeValues={
-            ':a': json.dumps(data),
-            ':s': 'completed'
-        },
-        ExpressionAttributeNames={
-            "#stat": "status" # 'status' is a reserved keyword in DynamoDB
-        }
-    )
-    return jsonify({"status": "updated"})
-
-@app.route('/api/media/<item_id>', methods=['DELETE'])
-def delete_media(item_id):
-    media_table.delete_item(Key={'id': item_id})
-    return jsonify({"status": "deleted"})
-
-@app.route('/api/users', methods=['GET'])
-def get_users():
-    response = users_table.scan()
-    items = response.get('Items', [])
-    # Clean output (remove passwords)
-    users = [{"id": u['id'], "name": u['name'], "email": u['email'], "role": u['role']} for u in items]
-    return jsonify(users)
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    # Use 0.0.0.0 so EC2 allows external traffic on port 5000
+    app.run(host='0.0.0.0', port=5000, debug=True)
