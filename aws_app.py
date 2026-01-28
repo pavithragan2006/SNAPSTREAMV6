@@ -111,7 +111,8 @@ def create_media():
         'url': data['url'],
         'thumbnail_url': data.get('thumbnailUrl'),
         'profile': data.get('profile'),
-        'upload_date': str(uuid.uuid1()) # Using a timestamp-based ID or current time string
+        'upload_date': str(uuid.uuid1()) 
+        # Using a timestamp-based ID or current time string
     }
     
     media_table.put_item(Item=media_item)
@@ -128,7 +129,8 @@ def update_analysis(item_id):
             ':stat': 'completed'
         },
         ExpressionAttributeNames={
-            "#s": "status" # 'status' is a reserved keyword in DynamoDB
+            "#s": "status" 
+            # 'status' is a reserved keyword in DynamoDB
         }
     )
     return jsonify({"status": "updated"})
