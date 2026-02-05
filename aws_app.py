@@ -12,7 +12,7 @@ CORS(app)
 
 # --- AWS Configuration ---
 REGION = 'us-east-1' 
-SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:266735801049:snapstream' 
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:600627324067:snapstream' 
 
 # Initialize AWS Resources
 # In EC2, this uses the IAM Role. Locally, it uses ~/.aws/credentials.
